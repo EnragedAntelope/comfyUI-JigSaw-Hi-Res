@@ -218,7 +218,7 @@ class JigsawHiRes:
             if timestep is not None and timestep.numel() > 0:
                 sigma = timestep.item()
                 if sigma_max > 0:
-                    value = max(0.0, min(1.0, sigma / sigma_max))
+                    value = max(0.0, min(1.0, 1.0 - (sigma / sigma_max)))
                     new_embedder.set_timestep(value)
 
             return model_function(
