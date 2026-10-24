@@ -45,7 +45,12 @@ class JigsawPosEmbed(nn.Module):
         for dim in axes_dim:
             assert dim % 2 == 0, f"Dimension {dim} muss gerade sein"
 
-        if self.n_axes_init == 3:
+        if self.n_axes_init == 4:
+            # MOSS-Image: (r, f, h, w)
+            self.dim_axis0 = axes_dim[0] + axes_dim[1]
+            self.dim_spatial = axes_dim[2] + axes_dim[3]
+
+        elif self.n_axes_init == 3:
             self.dim_axis0 = axes_dim[0]
             self.dim_spatial = axes_dim[1] + axes_dim[2]
 
@@ -57,7 +62,7 @@ class JigsawPosEmbed(nn.Module):
 
         else:
             raise ValueError(
-                "Nur 1, 2 oder 3 Achsen unterstützt"
+                "Nur 1, 2, 3 oder 4 Achsen unterstützt"
             )
 
         self.axes_dim = axes_dim
