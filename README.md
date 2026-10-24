@@ -55,7 +55,7 @@ sample as usual at your target resolution.
 | `rope_percentage` | 1.0 | Blend factor for how much of the computed scaling to actually apply (1.0 = full effect). |
 | `dype_enabled` | `True` | Master switch for the whole dynamic scaling path. Off = falls back to the model's original, untouched RoPE. |
 | `max_pe_length` | 64 | *(currently reserved — not yet wired into the scaling math)* |
-| `latent` *(optional)* | — | If connected, its shape is used to auto-derive the true target width/height (×8 VAE factor) instead of the manual `width`/`height` inputs. |
+| `latent` *(optional)* | — | If connected, its shape is used to auto-derive the true target width/height (×8, or ×16 for Flux2-VAE models) instead of the manual `width`/`height` inputs. |
 
 ## Compatibility
 
@@ -63,6 +63,14 @@ Requires a model whose diffusion backbone exposes a `pe_embedder` module
 with `.theta` and `.axes_dim` attributes, and whose native RoPE kernel
 consumes the same `[..., dim/2, 2, 2]` rotation-matrix format as
 `comfy.ldm.flux.math.rope()` (Flux.1 and Krea2/Flux.2-Klein-family models).
+**MOSS-Image** and **Fibo 2.0** are supported too (needs a ComfyUI recent
+enough to ship `comfy/ldm/moss_image` and `comfy/ldm/fibo2`). They build their
+RoPE inline instead of through a `pe_embedder`, so the node hooks their
+`comfy.ldm.flux.math.rope()` calls during the forward pass and scales only the
+spatial (height/width) axes; the text / gist-plane axes and MOSS-Image's
+reference images keep their trained frequencies. A connected `latent` is
+converted with the model's own VAE factor (16 for their Flux2 VAE).
+
 Models using a different RoPE convention are not supported and will raise a
 clear error on load rather than silently producing garbage.
 

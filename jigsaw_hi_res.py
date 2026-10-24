@@ -1,8 +1,22 @@
 import torch
 import torch.nn as nn
 import math
+from contextlib import contextmanager
+
+import comfy.ldm.flux.math
+import comfy.patcher_extension
 
 from .rope import rope_dype
+
+try:
+    from comfy.ldm.moss_image.model import MOSSImage
+except ImportError:
+    MOSSImage = None
+
+try:
+    from comfy.ldm.fibo2.model import Fibo2
+except ImportError:
+    Fibo2 = None
 
 
 class JigsawPosEmbed(nn.Module):
@@ -72,6 +86,27 @@ class JigsawPosEmbed(nn.Module):
         self.current_timestep = timestep
 
 
+    def rope(self, pos, dim, theta):
+        # Drop-in for comfy.ldm.flux.math.rope(pos, dim, theta) with this embedder's scaling
+        return rope_dype(
+            pos,
+            dim=dim,
+            theta=theta,
+            method=self.method,
+            rope_percentage=self.rope_percentage,
+            dype=self.dype,
+            yarn_ramp_type=self.yarn_ramp_type,
+            yarn_ratio=self.yarn_ratio,
+            yarn_beta_fast=self.yarn_beta_fast,
+            yarn_beta_slow=self.yarn_beta_slow,
+            current_timestep=self.current_timestep,
+            timestep_modulation=self.timestep_modulation,
+            theta_period_min=self.theta_period_min,
+            theta_period_max=self.theta_period_max,
+            attn_ratio=self.attn_ratio,
+        )
+
+
     def forward(self, ids):
         pos = ids.float()
 
@@ -87,28 +122,59 @@ class JigsawPosEmbed(nn.Module):
                 f"{len(self.axes_dim)} Eintraege ({self.axes_dim})"
             )
 
-        shared = {
-            "method": self.method,
-            "rope_percentage": self.rope_percentage,
-            "dype": self.dype,
-            "yarn_ramp_type": self.yarn_ramp_type,
-            "yarn_ratio": self.yarn_ratio,
-            "yarn_beta_fast": self.yarn_beta_fast,
-            "yarn_beta_slow": self.yarn_beta_slow,
-            "current_timestep": self.current_timestep,
-            "timestep_modulation": self.timestep_modulation,
-            "theta_period_min": self.theta_period_min,
-            "theta_period_max": self.theta_period_max,
-            "attn_ratio": self.attn_ratio,
-        }
-
-        parts = [
-            rope_dype(pos[..., i], dim=self.axes_dim[i], theta=self.theta, **shared)
-            for i in range(n_axes)
-        ]
+        parts = [self.rope(pos[..., i], self.axes_dim[i], self.theta) for i in range(n_axes)]
 
         emb = torch.cat(parts, dim=-3)  # [B, N, headdim/2, 2, 2]
         return emb.unsqueeze(1).to(ids.device)  # [B, 1, N, headdim/2, 2, 2]
+
+
+@contextmanager
+def _flux_rope_override(embedder, n_axes, spatial_axes):
+    """
+    Routes comfy.ldm.flux.math.rope() through the embedder for the spatial axes.
+    For models that build their pe inline (MOSS-Image, Fibo 2.0): they call it
+    once per axis, in axis order. Only the first n_axes calls are touched, so
+    the text/plane axes and any later call keep the trained frequencies.
+    """
+    orig = comfy.ldm.flux.math.rope
+    calls = [0]
+
+    def rope(pos, dim, theta):
+        i = calls[0]
+        calls[0] += 1
+        if i < n_axes and i in spatial_axes:
+            return embedder.rope(pos, dim, theta)
+        return orig(pos, dim, theta)
+
+    comfy.ldm.flux.math.rope = rope
+    try:
+        yield
+    finally:
+        comfy.ldm.flux.math.rope = orig
+
+
+def _patch_moss_image(m, embedder):
+    # axes (r, f, h, w): f carries the text positions, only h and w are scaled
+    orig_rope = m.get_model_object("diffusion_model.rope")
+
+    def moss_rope(h, w, *args, **kwargs):
+        if h * w == 0:
+            # preprocess_refs: the references keep the trained frequencies
+            return orig_rope(h, w, *args, **kwargs)
+        # the first four calls are the main pe; the references' second pass stays untouched
+        with _flux_rope_override(embedder, n_axes=4, spatial_axes=(2, 3)):
+            return orig_rope(h, w, *args, **kwargs)
+
+    m.add_object_patch("diffusion_model.rope", moss_rope)
+
+
+def _patch_fibo2(m, embedder):
+    # axes (plane, h, w): the plane axis orders gist tokens and images, only h and w are scaled
+    def fibo2_wrapper(executor, *args, **kwargs):
+        with _flux_rope_override(embedder, n_axes=3, spatial_axes=(1, 2)):
+            return executor(*args, **kwargs)
+
+    m.add_wrapper_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, "jigsaw_hi_res", fibo2_wrapper)
 
 
 class JigsawHiRes:
@@ -173,9 +239,10 @@ class JigsawHiRes:
         target_h = height
         
         if latent is not None:
-            # Latent Shape ist [B, C, H, W] - Flux und SD arbeiten mit Faktor 8
-            target_h = latent["samples"].shape[2] * 8
-            target_w = latent["samples"].shape[3] * 8
+            # Latent Shape ist [B, C, H, W] - Faktor 8 (Krea2/Flux/SD) oder 16 (Flux2-VAE: MOSS-Image, Fibo 2.0)
+            downscale = getattr(m.model.latent_format, "spacial_downscale_ratio", 8)
+            target_h = latent["samples"].shape[-2] * downscale
+            target_w = latent["samples"].shape[-1] * downscale
 
         # --- NEUE DIAGONAL-DÄMPFUNG GEGEN DEN GRAUSCHLEIER ---
         max_dim = max(target_w, target_h)
@@ -190,25 +257,37 @@ class JigsawHiRes:
         print(f"[Jigsaw] Target Res: {target_w}x{target_h} | Adjusted Max-Dim YaRN Ratio: {yarn_ratio:.4f}")
         # -----------------------------------------------------
 
-        try:
-            orig = m.model.diffusion_model.pe_embedder
-            theta = orig.theta
-            axes_dim = orig.axes_dim
-        except Exception:
-            raise ValueError("Kein kompatibles Krea2T pe_embedder gefunden")
+        diffusion_model = m.get_model_object("diffusion_model")
+        settings = {
+            "method": method,
+            "rope_percentage": rope_percentage,
+            "dype": dype_enabled,
+            "ori_max_pe_len_spatial": max_pe_length,
+            "yarn_ratio": yarn_ratio,
+            "timestep_modulation": timestep_modulation,
+        }
 
-        new_embedder = JigsawPosEmbed(
-            axes_dim=axes_dim,
-            theta=theta,
-            method=method,
-            rope_percentage=rope_percentage,
-            dype=dype_enabled,
-            ori_max_pe_len_spatial=max_pe_length,
-            yarn_ratio=yarn_ratio,
-            timestep_modulation=timestep_modulation
-        )
+        if MOSSImage is not None and isinstance(diffusion_model, MOSSImage):
+            # theta 10000 would hit the default NTK clamp; yarn_ratio is capped at 1.25 anyway
+            new_embedder = JigsawPosEmbed(axes_dim=diffusion_model.rope_axes_dim, theta=10000.0, theta_period_max=math.inf, **settings)
+            _patch_moss_image(m, new_embedder)
 
-        m.add_object_patch("diffusion_model.pe_embedder", new_embedder)
+        elif Fibo2 is not None and isinstance(diffusion_model, Fibo2):
+            new_embedder = JigsawPosEmbed(axes_dim=diffusion_model.rope_axes_dim, theta=256.0, theta_period_max=math.inf, **settings)
+            _patch_fibo2(m, new_embedder)
+
+        else:
+            try:
+                orig = diffusion_model.pe_embedder
+                theta = orig.theta
+                axes_dim = orig.axes_dim
+            except Exception:
+                raise ValueError(
+                    "Jigsaw Hi-Res: kein kompatibles Modell gefunden (Krea2/Flux pe_embedder, MOSS-Image oder Fibo 2.0)"
+                )
+
+            new_embedder = JigsawPosEmbed(axes_dim=axes_dim, theta=theta, **settings)
+            m.add_object_patch("diffusion_model.pe_embedder", new_embedder)
 
         sigma_max = m.model.model_sampling.sigma_max.item()
 
