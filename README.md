@@ -54,7 +54,7 @@ sample as usual at your target resolution.
 | `method` | `yarn` | `yarn` — per-frequency-band interpolation (recommended, best quality at large upscales). `ntk` — single global frequency-base rescale (cheaper, less precise). `base` — disables scaling entirely (pass-through RoPE). |
 | `rope_percentage` | 1.0 | Blend factor for how much of the computed scaling to actually apply (1.0 = full effect). |
 | `dype_enabled` | `True` | Master switch for the whole dynamic scaling path. Off = falls back to the model's original, untouched RoPE. |
-| `max_pe_length` | 64 | *(currently reserved — not yet wired into the scaling math)* |
+| `max_pe_length` | 64 | MOSS-Image / Fibo 2.0: trained size in latent tokens per side (64 = 1024px). Unused for Krea2/Flux. |
 | `latent` *(optional)* | — | If connected, its shape is used to auto-derive the true target width/height (×8, or ×16 for Flux2-VAE models) instead of the manual `width`/`height` inputs. |
 
 ## Compatibility
@@ -70,6 +70,15 @@ RoPE inline instead of through a `pe_embedder`, so the node hooks their
 spatial (height/width) axes; the text / gist-plane axes and MOSS-Image's
 reference images keep their trained frequencies. A connected `latent` is
 converted with the model's own VAE factor (16 for their Flux2 VAE).
+
+For these two models the scaling follows the official
+[DyPE](https://github.com/guyyariv/DyPE) Dy-YaRN / Dy-NTK code rather than the
+Krea2-tuned ratio above: each axis is scaled by its real target / trained
+extent (`max_pe_length` = trained size in tokens, 64 = 1024px; no 1.25 cap),
+YaRN picks the bands by rotation count and adds its attention temperature, and
+`timestep_modulation` uses DyPE's κ(t) = t² schedule: strongest at the start
+of sampling, where the layout (and any duplication) is decided, fading to the
+trained frequencies at the end. Krea2/Flux behave exactly as before.
 
 Models using a different RoPE convention are not supported and will raise a
 clear error on load rather than silently producing garbage.
