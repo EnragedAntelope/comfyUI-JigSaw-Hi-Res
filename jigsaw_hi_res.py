@@ -222,8 +222,8 @@ class JigsawHiRes:
         return {
             "required": {
                 "model": ("MODEL",),
-                "width": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8}),
-                "height": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8}),
+                "width": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8, "tooltip": "Target image width in pixels (e.g. 1024), not latent tokens. Ignored when a latent is connected: its size is used instead."}),
+                "height": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8, "tooltip": "Target image height in pixels (e.g. 1024), not latent tokens. Ignored when a latent is connected: its size is used instead."}),
                 "method": (
                     ["yarn", "ntk", "base"],
                     {"default": "yarn"}
